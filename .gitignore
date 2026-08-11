@@ -1,0 +1,14 @@
+node_modules/
+dist/
+out/
+out-large/
+
+# Manifestes produits par `npm run setup` — spécifiques à un cluster,
+# régénérables à volonté. Ne contiennent aucun secret.
+deploy/generated/
+*.log
+.env
+.env.local
+
+# artefacts Maven de l'agent
+agent/target/

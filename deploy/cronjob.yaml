@@ -1,0 +1,127 @@
+---
+# Secret attendu (à créer hors de ce dépôt) :
+#
+#   kubectl create secret generic rabbit-monitoring -n platform \
+#     --from-literal=username=eventmap \
+#     --from-literal=password='...'
+#
+# L'utilisateur RabbitMQ doit porter le tag `monitoring` — lecture seule sur
+# l'API management. Surtout pas `administrator`.
+#
+# Et pour la publication de la carte :
+#
+#   kubectl create secret generic event-map-git -n platform \
+#     --from-literal=token='ghp_...'
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: event-map-discovery
+  namespace: platform
+spec:
+  # Le job est déclenché à la main ou par la CI après déploiement. La planification
+  # n'est là que comme filet de sécurité : `suspend: true` la neutralise tant qu'on
+  # ne l'active pas explicitement.
+  schedule: "0 3 * * *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # Un scan qui traîne capture une topologie incohérente : mieux vaut
+      # échouer et relancer que produire une carte à moitié vraie.
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: event-map-discovery
+        spec:
+          serviceAccountName: event-map-discovery
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: discovery
+              image: registry.internal/event-system-visualizer:1.0.0
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: CLUSTER_NAME
+                  value: production
+
+                # --- RabbitMQ ------------------------------------------------
+                - name: RABBIT_MGMT_URL
+                  value: http://rabbitmq.messaging.svc.cluster.local:15672
+                - name: RABBIT_VHOST
+                  value: "/"
+                - name: RABBIT_USER
+                  valueFrom:
+                    secretKeyRef: { name: rabbit-monitoring, key: username }
+                - name: RABBIT_PASS
+                  valueFrom:
+                    secretKeyRef: { name: rabbit-monitoring, key: password }
+
+                # --- Périmètre Kubernetes ------------------------------------
+                # Vide = tous les namespaces. Restreindre accélère nettement le
+                # scan sur un gros cluster.
+                - name: K8S_NAMESPACES
+                  value: "orders,billing,shipping"
+                - name: MANIFEST_PORT
+                  value: "8080"
+                - name: MANIFEST_PATH
+                  value: /internal/event-manifest
+
+                # --- Conventions de nommage ----------------------------------
+                - name: EVENT_PREFIXES
+                  value: "evt,event"
+                - name: COMMAND_PREFIXES
+                  value: "cmd,command"
+                - name: DLQ_PATTERNS
+                  value: ".dlq,.dead,-dlq,.parking"
+
+                # --- Sortie --------------------------------------------------
+                - name: OUTPUT_DIR
+                  value: /tmp/out
+                # Une arête doit disparaître 3 runs de suite avant d'être retirée :
+                # sans ce sursis, un rolling update fait clignoter la carte.
+                - name: STALE_AFTER_RUNS
+                  value: "3"
+
+                # --- Publication git -----------------------------------------
+                - name: GIT_ENABLED
+                  value: "true"
+                - name: GIT_REPO_URL
+                  value: https://github.com/acme/platform-docs.git
+                - name: GIT_REPO_DIR
+                  value: /tmp/repo
+                - name: GIT_SUBDIR
+                  value: docs/event-map
+                - name: GIT_BASE_BRANCH
+                  value: main
+                - name: GIT_OPEN_PR
+                  value: "true"
+                - name: GITHUB_REPOSITORY
+                  value: acme/platform-docs
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef: { name: event-map-git, key: token }
+              volumeMounts:
+                - name: work
+                  mountPath: /tmp
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                limits: { memory: 768Mi }
+          volumes:
+            # readOnlyRootFilesystem impose un volume inscriptible pour le clone
+            # git, les artefacts et les fichiers temporaires de node.
+            - name: work
+              emptyDir: { sizeLimit: 512Mi }

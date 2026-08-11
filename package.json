@@ -1,0 +1,30 @@
+{
+  "name": "event-system-visualizer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Découverte automatique de la topologie événementielle RabbitMQ sur Kubernetes",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "event-map": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "try": "node scripts/try.mjs",
+    "setup": "node scripts/setup.mjs",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@kubernetes/client-node": "^0.22.3",
+    "cytoscape": "^3.30.2",
+    "elkjs": "^0.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.4"
+  }
+}

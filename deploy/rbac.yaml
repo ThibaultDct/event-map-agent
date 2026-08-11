@@ -1,0 +1,35 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: event-map-discovery
+  namespace: platform
+---
+# Lecture seule, à l'échelle du cluster : la découverte doit voir les pods de
+# tous les namespaces applicatifs pour corréler les IP des consommateurs AMQP.
+# Aucun verbe d'écriture n'est nécessaire — si un jour il en faut un, c'est le
+# signe que le job dépasse son mandat.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: event-map-discovery
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: event-map-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: event-map-discovery
+subjects:
+  - kind: ServiceAccount
+    name: event-map-discovery
+    namespace: platform

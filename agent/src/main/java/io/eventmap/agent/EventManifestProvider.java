@@ -6,6 +6,7 @@ import org.springframework.amqp.core.Binding;
 import org.springframework.amqp.rabbit.listener.AbstractMessageListenerContainer;
 import org.springframework.amqp.rabbit.listener.MessageListenerContainer;
 import org.springframework.amqp.rabbit.listener.RabbitListenerEndpointRegistry;
+import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
@@ -32,7 +33,7 @@ import java.util.function.UnaryOperator;
  * carte. La logique vit donc ici, et {@link EventManifestEndpoint} comme
  * {@link StandaloneManifestServer} ne sont que deux transports.
  */
-public class EventManifestProvider {
+public class EventManifestProvider implements InitializingBean {
 
     private static final String MANIFEST_PATTERN = "classpath*:META-INF/event-publishers.json";
     private static final String CONSUMERS_PATTERN = "classpath*:META-INF/event-consumers.json";
@@ -45,9 +46,16 @@ public class EventManifestProvider {
     private final String applicationName;
     /** Sert à résoudre les `${...}` dans les noms de queues des @RabbitListener. */
     private final UnaryOperator<String> placeholderResolver;
+    /** Ne déclarer que les messages réellement émis par ce service. */
+    private final boolean attributeByObservation;
 
-    /** Le manifeste est immuable pendant la vie du process : on le lit une fois. */
-    private volatile List<Map<String, Object>> cachedPublishes;
+    /**
+     * Le manifeste lu sur le classpath est immuable : on le parse une fois.
+     * Le <em>filtrage</em> par observation, lui, ne peut pas être mis en cache —
+     * les émissions s'accumulent pendant la vie du pod, et figer la liste au
+     * premier appel masquerait tout ce qui est publié ensuite.
+     */
+    private volatile List<Map<String, Object>> parsedPublishes;
     private volatile List<Map<String, Object>> cachedExpectations;
 
     public EventManifestProvider(ObjectProvider<Binding> bindings,
@@ -55,13 +63,32 @@ public class EventManifestProvider {
                                  ObjectProvider<ObservedPublicationRecorder> recorders,
                                  ObjectMapper mapper,
                                  String applicationName,
-                                 UnaryOperator<String> placeholderResolver) {
+                                 UnaryOperator<String> placeholderResolver,
+                                 boolean attributeByObservation) {
         this.bindings = bindings;
         this.registries = registries;
         this.recorders = recorders;
         this.mapper = mapper;
         this.applicationName = applicationName;
         this.placeholderResolver = placeholderResolver;
+        this.attributeByObservation = attributeByObservation;
+    }
+
+    /**
+     * Le filtrage par observation n'a de sens qu'avec l'enregistreur actif :
+     * sans lui, aucune émission n'est vue et la liste des publications serait
+     * intégralement vidée — un service parfaitement fonctionnel apparaîtrait
+     * comme ne publiant rien. On refuse de démarrer plutôt que de produire une
+     * carte silencieusement fausse.
+     */
+    @Override
+    public void afterPropertiesSet() {
+        if (attributeByObservation && recorders.getIfAvailable() == null) {
+            throw new IllegalStateException(
+                    "eventmap.attribute-by-observation=true exige eventmap.record-observed=true : "
+                            + "l'attribution repose sur les publications observées, et sans enregistreur "
+                            + "aucune ne le serait — le service se déclarerait producteur de rien.");
+        }
     }
 
     public Map<String, Object> manifest() {
@@ -71,6 +98,9 @@ public class EventManifestProvider {
         body.put("listening", listening());
         body.put("publishes", publishes());
         body.put("expects", expectations());
+        // Dit au job — et à qui interroge l'endpoint à la main — pourquoi la liste
+        // des publications peut être plus courte que le catalogue du classpath.
+        body.put("attribution", attributeByObservation ? "observed" : "declared");
 
         ObservedPublicationRecorder recorder = recorders.getIfAvailable();
         if (recorder != null) {
@@ -124,7 +154,36 @@ public class EventManifestProvider {
      * en modules Maven en produit un par module.
      */
     private List<Map<String, Object>> publishes() {
-        List<Map<String, Object>> cached = this.cachedPublishes;
+        List<Map<String, Object>> all = parsedPublishes();
+        if (!attributeByObservation) {
+            return all;
+        }
+        // Les classes d'événements vivent souvent dans un module partagé : leur
+        // manifeste se retrouve alors dans le jar de *tous* les services, et
+        // chacun se déclarerait producteur du catalogue entier. Seule l'émission
+        // réellement observée distingue le vrai émetteur des autres.
+        ObservedPublicationRecorder recorder = recorders.getIfAvailable();
+        if (recorder == null) {
+            return List.of();
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        for (Map<String, Object> o : recorder.snapshot()) {
+            Object key = o.get("routingKey");
+            if (key != null) {
+                seen.add(key.toString());
+            }
+        }
+        List<Map<String, Object>> kept = new ArrayList<>();
+        for (Map<String, Object> entry : all) {
+            if (seen.contains(String.valueOf(entry.get("routingKey")))) {
+                kept.add(entry);
+            }
+        }
+        return List.copyOf(kept);
+    }
+
+    private List<Map<String, Object>> parsedPublishes() {
+        List<Map<String, Object>> cached = this.parsedPublishes;
         if (cached != null) {
             return cached;
         }
@@ -142,8 +201,8 @@ public class EventManifestProvider {
             // le job dégradera en « publications inconnues » pour ce service.
             all = List.of();
         }
-        this.cachedPublishes = List.copyOf(all);
-        return this.cachedPublishes;
+        this.parsedPublishes = List.copyOf(all);
+        return this.parsedPublishes;
     }
 
     /**

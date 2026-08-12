@@ -38,8 +38,9 @@ public class EventMapAutoConfiguration {
                                                        Environment env) {
         String appName = env.getProperty("spring.application.name", "unknown");
         ObjectMapper mapper = mappers.getIfAvailable(ObjectMapper::new);
+        boolean byObservation = env.getProperty("eventmap.attribute-by-observation", Boolean.class, false);
         return new EventManifestProvider(bindings, registries, recorders, mapper, appName,
-                env::resolvePlaceholders);
+                env::resolvePlaceholders, byObservation);
     }
 
     /** Service web : le manifeste se greffe sur le port applicatif existant. */

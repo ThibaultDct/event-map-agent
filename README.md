@@ -865,12 +865,51 @@ Le token git n'est jamais persisté dans un remote : il est injecté via un head
 
 ```yaml
 eventmap:
-  enabled: true                  # défaut
-  path: /internal/event-manifest # défaut
-  standalone-port: 8081          # worker sans servlet uniquement
-  record-observed: false         # niveau 1 (cf. étape 3.3)
-  max-observed-keys: 500         # borne la cardinalité
+  enabled: true                    # défaut
+  path: /internal/event-manifest   # défaut
+  standalone-port: 8081            # worker sans servlet uniquement
+  record-observed: false           # niveau 1 (cf. étape 3.3)
+  max-observed-keys: 500           # borne la cardinalité
+  attribute-by-observation: false  # classes d'événements en module partagé
 ```
+
+### Classes d'événements dans un module partagé
+
+Si vos classes de messages vivent dans une stack commune plutôt que dans chaque service,
+leur manifeste se retrouve dans le jar de **tous** les workers — et chacun se déclare
+producteur du catalogue entier. Les deux moitiés ne se dégradent pas pareil :
+
+| | Effet |
+|---|---|
+| Événements | La clé `evt.{application}.X` se résout au nom de chaque worker : 20 workers × 50 événements = 1000 déclarations dont 50 vraies, les autres en `orphan-event`. Bruyant |
+| Commandes | La cible est figée dans l'annotation, donc les 20 workers déclarent la **même** clé, et les 20 arêtes matchent le binding. **La carte devient fausse**, pas seulement bruyante |
+
+La parade :
+
+```yaml
+eventmap:
+  record-observed: true
+  attribute-by-observation: true
+```
+
+Le service ne déclare alors que les clés qu'il a **réellement publiées**. Le catalogue et
+les schémas continuent de venir du manifeste — la détection de rupture et le
+`contract-mismatch` sont intacts — mais l'attribution devient exacte par construction.
+C'est la seule information qui distingue le vrai émetteur des autres, et elle n'existe
+qu'au runtime : aucun processeur d'annotations ne peut inspecter le corps d'une méthode
+pour y trouver `publish(new InstructionUpdatedEvent(...))`.
+
+L'endpoint expose `"attribution": "observed"` ou `"declared"`, pour qu'on sache pourquoi
+la liste peut être plus courte que le catalogue. Activer le filtre sans `record-observed`
+**empêche le démarrage** : le filtre viderait tout, et un service parfaitement fonctionnel
+apparaîtrait comme ne publiant rien.
+
+> **La contrepartie.** L'attribution ne connaît que ce qui est passé depuis le démarrage du
+> pod. Un événement rare — batch mensuel, chemin d'erreur, compensation — n'apparaît pas
+> tant qu'il n'a pas été émis une fois. Il n'est pas *faux*, il est *absent* : la clé figure
+> au catalogue avec son schéma, sans producteur rattaché, et remonte en `starved-queue` chez
+> ses consommateurs. Lancer le scan après une campagne de tests end-to-end couvre les
+> chemins rares.
 
 **Worker sans `spring-boot-starter-web`.** Un worker AMQP n'a ni servlet ni port : un
 `@RestController` n'y est jamais instancié. L'agent ouvre donc un port dédié avec le

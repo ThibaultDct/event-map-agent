@@ -13,6 +13,7 @@ import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
+import javax.lang.model.type.TypeVariable;
 import javax.lang.model.util.ElementFilter;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
@@ -67,8 +68,16 @@ final class SchemaExtractor {
             "java.time.LocalDateTime", "java.time.OffsetDateTime", "java.time.ZonedDateTime",
             "java.time.Duration", "java.time.Period", "java.time.Year", "java.time.YearMonth");
 
-    /** Un champ du payload : son chemin depuis la racine, et son type. */
-    record Field(String path, String type) { }
+    /**
+     * Un champ du payload : son chemin depuis la racine, et son type.
+     *
+     * @param bound vrai quand le type n'est qu'une <em>borne</em>, faute d'avoir pu
+     *              résoudre une variable de type. Le contrat réel est au moins
+     *              celui-là, peut-être plus précis — la distinction évite au
+     *              détecteur de rupture de crier quand une classe passe de
+     *              générique à paramétrée.
+     */
+    record Field(String path, String type, boolean bound) { }
 
     private final Types types;
     private final Elements elements;
@@ -102,20 +111,30 @@ final class SchemaExtractor {
             }
             String name = jsonName(field);
             String path = prefix.isEmpty() ? name : prefix + "." + name;
-            emit(unwrapOptional(field.asType()), path, depth, onPath, out);
+            emit(unwrapOptional(resolve(type, field)), path, depth, onPath, out);
         }
 
         onPath.remove(fqn);
     }
 
     /** Écrit une entrée pour ce champ, et descend dedans si c'est une structure. */
-    private void emit(TypeMirror type, String path, int depth, Set<String> onPath, List<Field> out) {
+    private void emit(TypeMirror declared, String path, int depth, Set<String> onPath, List<Field> out) {
+        // Variable de type non résolue : la classe est restée générique au lieu
+        // d'être paramétrée par une sous-classe. On retombe sur la borne — c'est
+        // la partie du contrat réellement garantie — en marquant l'approximation.
+        boolean bound = false;
+        TypeMirror type = declared;
+        if (type.getKind() == TypeKind.TYPEVAR) {
+            type = ((TypeVariable) type).getUpperBound();
+            bound = true;
+        }
+
         TypeMirror element = elementTypeOf(type);
         if (element != null) {
             // Collection ou tableau : le suffixe `[]` porte la cardinalité, si
             // bien qu'un passage de `List<Foo>` à `Foo` apparaît comme un chemin
             // supprimé et un chemin ajouté — donc comme une rupture.
-            out.add(new Field(path + "[]", describe(element)));
+            out.add(new Field(path + "[]", describe(element), bound));
             // Le test de feuille vaut aussi ici : sans lui, un `String[]` fait
             // descendre dans les champs internes de java.lang.String.
             if (!isLeaf(element)) {
@@ -126,10 +145,10 @@ final class SchemaExtractor {
         if (isMap(type)) {
             // Un dictionnaire est ouvert par nature : on note son existence et
             // son typage, sans prétendre en énumérer les clés.
-            out.add(new Field(path + "{}", describe(type)));
+            out.add(new Field(path + "{}", describe(type), bound));
             return;
         }
-        out.add(new Field(path, describe(type)));
+        out.add(new Field(path, describe(type), bound));
         if (!isLeaf(type)) {
             walk(type, path, depth + 1, onPath, out);
         }
@@ -167,6 +186,30 @@ final class SchemaExtractor {
     private String shorten(TypeMirror t) {
         TypeElement te = asTypeElement(t);
         return te == null ? t.toString() : te.getSimpleName().toString();
+    }
+
+    /**
+     * Résout le type d'un champ <em>tel que vu depuis</em> la classe qu'on parcourt.
+     *
+     * <p>Indispensable dès qu'un événement est générique. Pour
+     * {@code FxTradeExecuted extends FxEvent<FxInstructionDto>}, le champ
+     * {@code instruction} est déclaré {@code T} dans {@code FxEvent} : lu
+     * naïvement via {@code field.asType()}, le schéma contiendrait
+     * « instruction : T », ce qui ne documente rien et ne permet aucune détection
+     * de rupture. {@code asMemberOf} substitue les arguments de type et rend le
+     * vrai {@code FxInstructionDto}.
+     */
+    private TypeMirror resolve(TypeMirror owner, VariableElement field) {
+        if (owner instanceof DeclaredType dt) {
+            try {
+                return types.asMemberOf(dt, field);
+            } catch (IllegalArgumentException e) {
+                // Le champ n'est pas un membre de ce type (cas limite des classes
+                // internes) : on retombe sur le type déclaré, sans substitution.
+                return field.asType();
+            }
+        }
+        return field.asType();
     }
 
     /** Champs déclarés, y compris ceux hérités des classes parentes. */

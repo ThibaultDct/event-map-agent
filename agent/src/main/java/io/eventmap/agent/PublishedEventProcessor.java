@@ -4,9 +4,11 @@ import javax.annotation.processing.AbstractProcessor;
 import javax.annotation.processing.Filer;
 import javax.annotation.processing.RoundEnvironment;
 import javax.annotation.processing.SupportedAnnotationTypes;
+import javax.annotation.processing.SupportedOptions;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.MirroredTypeException;
 import javax.lang.model.type.TypeMirror;
@@ -22,62 +24,82 @@ import java.util.Set;
 import java.util.StringJoiner;
 
 /**
- * Produit {@code META-INF/event-publishers.json} à partir des {@link PublishesEvent}
- * trouvées à la compilation.
+ * Produit {@code META-INF/event-publishers.json} à la compilation.
  *
- * <p>Le manifeste est ainsi <em>baké dans le jar</em> : il ne peut pas dériver du
- * code, contrairement à un fichier maintenu à la main. Le processeur est déclaré
- * dans {@code META-INF/services}, donc javac le découvre tout seul dès que l'agent
- * est sur le classpath de compilation — aucune configuration Maven côté service.
+ * <p>Deux sources, dans cet ordre de priorité :
+ *
+ * <ol>
+ *   <li>les éléments portant {@link PublishesEvent} — la déclaration explicite
+ *       l'emporte toujours ;</li>
+ *   <li>toute classe héritant d'un <b>type de base</b> configuré, dont la routing
+ *       key est alors calculée par convention.</li>
+ * </ol>
+ *
+ * <p>Le second mode est celui qui permet de ne rien déclarer. Les types de base
+ * se donnent en options de compilation :
+ *
+ * <pre>{@code
+ * <compilerArgs>
+ *   <arg>-Aeventmap.eventBase=com.acme.stack.FxEvent</arg>
+ *   <arg>-Aeventmap.commandBase=com.acme.stack.Command</arg>
+ * </compilerArgs>
+ * }</pre>
+ *
+ * <p><b>Convention.</b> Un événement donne {@code evt.<application>.<NomDeClasse>},
+ * une commande {@code cmd.<cible>.<NomDeClasse>}. Le nom de l'application n'est
+ * pas connu du compilateur : le manifeste conserve le marqueur
+ * {@value #APPLICATION_PLACEHOLDER}, que {@link EventManifestProvider} substitue
+ * au runtime par {@code spring.application.name}. C'est plus fiable que de passer
+ * l'artifactId Maven, qui n'est pas toujours le nom applicatif.
  */
-@SupportedAnnotationTypes({
-        "io.eventmap.agent.PublishesEvent",
-        "io.eventmap.agent.PublishesEvents"
-})
+@SupportedAnnotationTypes("*")
+@SupportedOptions({ PublishedEventProcessor.OPT_EVENT_BASE, PublishedEventProcessor.OPT_COMMAND_BASE })
 public class PublishedEventProcessor extends AbstractProcessor {
 
+    static final String OPT_EVENT_BASE = "eventmap.eventBase";
+    static final String OPT_COMMAND_BASE = "eventmap.commandBase";
+
+    /** Résolu au runtime, le compilateur ne connaît pas le nom de l'application. */
+    static final String APPLICATION_PLACEHOLDER = "{application}";
+
     private static final String OUTPUT = "META-INF/event-publishers.json";
+    private static final String OUTPUT_CONSUMERS = "META-INF/event-consumers.json";
+
+    /** Accumulé sur tous les rounds : on n'écrit qu'à la toute fin. */
+    private final List<String> entries = new ArrayList<>();
+    /** Attentes des {@code @RabbitListener} : la moitié consommateur du contrat. */
+    private final List<String> consumerEntries = new ArrayList<>();
+    /** Évite d'émettre deux fois une classe vue à la fois annotée et par supertype. */
+    private final Set<String> emitted = new LinkedHashSet<>();
+    /** N'avertir qu'une fois par type de base introuvable, pas une fois par round. */
+    private final Set<String> warnedMissingBase = new LinkedHashSet<>();
+
+    /**
+     * Re-résolus à chaque round : un {@code TypeMirror} conservé d'un round à
+     * l'autre peut devenir obsolète si d'autres processeurs génèrent du code.
+     */
+    private List<TypeMirror> eventBases = List.of();
+    private List<TypeMirror> commandBases = List.of();
 
     /**
      * Déclaré dynamiquement plutôt que par {@code @SupportedSourceVersion} : une
      * valeur figée ferait émettre à javac un avertissement « supported source
      * version less than -source » à chaque compilation de chaque service dès que
-     * le JDK avance. Le processeur ne lit que des annotations, il est indifférent
-     * à la version du langage.
+     * le JDK avance.
      */
     @Override
     public SourceVersion getSupportedSourceVersion() {
         return SourceVersion.latestSupported();
     }
 
-    /** Accumulé sur tous les rounds : on n'écrit qu'à la toute fin. */
-    private final List<String> entries = new ArrayList<>();
-
     @Override
     public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
-        Set<Element> annotated = new LinkedHashSet<>();
-        annotated.addAll(roundEnv.getElementsAnnotatedWith(PublishesEvent.class));
-        // Une annotation répétée est portée par son conteneur, pas par l'annotation
-        // elle-même : sans cette seconde passe, les méthodes qui publient plusieurs
-        // événements seraient silencieusement ignorées.
-        annotated.addAll(roundEnv.getElementsAnnotatedWith(PublishesEvents.class));
+        eventBases = bases(OPT_EVENT_BASE);
+        commandBases = bases(OPT_COMMAND_BASE);
 
-        for (Element element : annotated) {
-            for (PublishesEvent a : element.getAnnotationsByType(PublishesEvent.class)) {
-                if (a.routingKey().isBlank()) {
-                    processingEnv.getMessager().printMessage(
-                            Diagnostic.Kind.ERROR, "@PublishesEvent exige une routingKey non vide", element);
-                    continue;
-                }
-                if (a.routingKey().contains("*") || a.routingKey().contains("#")) {
-                    processingEnv.getMessager().printMessage(
-                            Diagnostic.Kind.WARNING,
-                            "@PublishesEvent.routingKey contient un joker AMQP : une publication "
-                                    + "porte une clé concrète, pas un pattern de binding.", element);
-                }
-                entries.add(toJson(a, element));
-            }
-        }
+        processAnnotated(roundEnv);
+        processBySupertype(roundEnv);
+        processListeners(roundEnv);
 
         if (roundEnv.processingOver()) {
             write();
@@ -87,19 +109,215 @@ public class PublishedEventProcessor extends AbstractProcessor {
         return false;
     }
 
-    private String toJson(PublishesEvent a, Element element) {
+    // ------------------------------------------------------------ déclarations
+
+    private void processAnnotated(RoundEnvironment roundEnv) {
+        Set<Element> annotated = new LinkedHashSet<>();
+        annotated.addAll(roundEnv.getElementsAnnotatedWith(PublishesEvent.class));
+        // Une annotation répétée est portée par son conteneur, pas par l'annotation
+        // elle-même : sans cette seconde passe, les méthodes qui publient plusieurs
+        // événements seraient silencieusement ignorées.
+        annotated.addAll(roundEnv.getElementsAnnotatedWith(PublishesEvents.class));
+
+        for (Element element : annotated) {
+            for (PublishesEvent a : element.getAnnotationsByType(PublishesEvent.class)) {
+                emit(element, a);
+            }
+        }
+    }
+
+    /**
+     * Nature déduite des supertypes. Utilisée aussi bien par le balayage par
+     * convention que par le chemin annoté : une commande annotée pour sa seule
+     * cible doit rester reconnue comme commande.
+     */
+    private String inferKind(Element element) {
+        if (!(element instanceof TypeElement te)) {
+            return null;
+        }
+        boolean isEvent = isAssignableToAny(te, eventBases);
+        boolean isCommand = isAssignableToAny(te, commandBases);
+        if (isEvent && isCommand) {
+            warn(te, "hérite à la fois d'un type d'événement et d'un type de commande — ignorée");
+            return null;
+        }
+        return isEvent ? "event" : isCommand ? "command" : null;
+    }
+
+    // ---------------------------------------------------------- par convention
+
+    private void processBySupertype(RoundEnvironment roundEnv) {
+        if (eventBases.isEmpty() && commandBases.isEmpty()) {
+            return;
+        }
+        for (Element root : roundEnv.getRootElements()) {
+            for (TypeElement te : collectTypes(root)) {
+                // Les classes de base et les enveloppes intermédiaires ne sont pas
+                // des messages : seules les classes instanciables le sont.
+                if (te.getModifiers().contains(Modifier.ABSTRACT) || te.getKind() != ElementKind.CLASS) {
+                    continue;
+                }
+                if (inferKind(te) == null) {
+                    continue;
+                }
+                emit(te, te.getAnnotation(PublishesEvent.class));
+            }
+        }
+    }
+
+    /** Les classes imbriquées comptent aussi : un fichier peut en déclarer plusieurs. */
+    private List<TypeElement> collectTypes(Element root) {
+        List<TypeElement> out = new ArrayList<>();
+        if (root instanceof TypeElement te) {
+            out.add(te);
+            for (Element nested : te.getEnclosedElements()) {
+                if (nested instanceof TypeElement) {
+                    out.addAll(collectTypes(nested));
+                }
+            }
+        }
+        return out;
+    }
+
+    private List<TypeMirror> bases(String option) {
+        String raw = processingEnv.getOptions().get(option);
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        List<TypeMirror> out = new ArrayList<>();
+        for (String fqn : raw.split(",")) {
+            String name = fqn.trim();
+            if (name.isEmpty()) {
+                continue;
+            }
+            TypeElement te = processingEnv.getElementUtils().getTypeElement(name);
+            if (te == null) {
+                if (warnedMissingBase.add(name)) {
+                    processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
+                            "event-map : type de base introuvable sur le classpath — " + name);
+                }
+                continue;
+            }
+            out.add(processingEnv.getTypeUtils().erasure(te.asType()));
+        }
+        return out;
+    }
+
+    private boolean isAssignableToAny(TypeElement te, List<TypeMirror> bases) {
+        TypeMirror self = processingEnv.getTypeUtils().erasure(te.asType());
+        for (TypeMirror base : bases) {
+            if (processingEnv.getTypeUtils().isAssignable(self, base)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ----------------------------------------------------------- consommateurs
+
+    private void processListeners(RoundEnvironment roundEnv) {
+        ConsumedEventScanner scanner = new ConsumedEventScanner(processingEnv);
+        for (Element root : roundEnv.getRootElements()) {
+            for (TypeElement te : collectTypes(root)) {
+                for (ConsumedEventScanner.Expectation e : scanner.scan(te)) {
+                    if (!emitted.add("listener|" + e.handler())) {
+                        continue;
+                    }
+                    consumerEntries.add(consumerJson(e));
+                }
+            }
+        }
+    }
+
+    private String consumerJson(ConsumedEventScanner.Expectation e) {
+        StringJoiner queues = new StringJoiner(",", "[", "]");
+        e.queues().forEach(q -> queues.add(quote(q)));
+
         StringBuilder sb = new StringBuilder("    {");
-        sb.append("\"routingKey\":").append(quote(a.routingKey()));
-        if (!a.exchange().isBlank()) {
+        sb.append("\"handler\":").append(quote(e.handler()));
+        sb.append(",\"payload\":").append(quote(e.payload()));
+        sb.append(",\"queues\":").append(queues);
+        if (!e.schema().isEmpty()) {
+            StringJoiner j = new StringJoiner(",", "[", "]");
+            for (SchemaExtractor.Field f : e.schema()) {
+                j.add("{\"path\":" + quote(f.path()) + ",\"type\":" + quote(f.type())
+                        + (f.bound() ? ",\"bound\":true" : "") + "}");
+            }
+            sb.append(",\"schema\":").append(j);
+        }
+        return sb.append("}").toString();
+    }
+
+    // ------------------------------------------------------------------ commun
+
+    /** @param a annotation portée par l'élément, ou {@code null} */
+    private void emit(Element element, PublishesEvent a) {
+        String id = element.toString();
+        if (!emitted.add(id + "|" + (a == null ? "" : a.routingKey() + a.target()))) {
+            return;
+        }
+
+        String kind = a != null && !a.kind().isBlank() ? a.kind() : inferKind(element);
+        String routingKey = a != null ? a.routingKey() : "";
+
+        if (routingKey.isBlank()) {
+            routingKey = derive(element, kind, a);
+            if (routingKey == null) {
+                return;
+            }
+        }
+        if (routingKey.contains("*") || routingKey.contains("#")) {
+            warn(element, "@PublishesEvent.routingKey contient un joker AMQP : une publication "
+                    + "porte une clé concrète, pas un pattern de binding.");
+        }
+
+        TypeMirror payloadType = payloadTypeOf(a, element);
+        entries.add(toJson(routingKey, kind, a, payloadType, element));
+    }
+
+    /** Applique la convention. Renvoie {@code null} si la clé ne peut pas être formée. */
+    private String derive(Element element, String kind, PublishesEvent a) {
+        if (!(element instanceof TypeElement te)) {
+            error(element, "@PublishesEvent sur une méthode exige une routingKey explicite : "
+                    + "rien ne permet de la déduire d'une signature.");
+            return null;
+        }
+        String simple = te.getSimpleName().toString();
+        if ("command".equals(kind)) {
+            String target = a == null ? "" : a.target();
+            if (target.isBlank()) {
+                error(te, "commande sans destinataire : ajoutez @PublishesEvent(target = \"<worker-cible>\"). "
+                        + "Une commande est adressée, sa cible ne peut pas être déduite du code.");
+                return null;
+            }
+            return "cmd." + target + "." + simple;
+        }
+        if ("event".equals(kind)) {
+            if (a != null && !a.target().isBlank()) {
+                warn(te, "target est ignoré sur un événement : son origine est l'application émettrice.");
+            }
+            return "evt." + APPLICATION_PLACEHOLDER + "." + simple;
+        }
+        error(element, "nature du message inconnue : précisez kind = \"event\" ou \"command\", "
+                + "ou faites hériter la classe d'un type de base déclaré via -A" + OPT_EVENT_BASE + ".");
+        return null;
+    }
+
+    private String toJson(String routingKey, String kind, PublishesEvent a, TypeMirror payloadType, Element element) {
+        StringBuilder sb = new StringBuilder("    {");
+        sb.append("\"routingKey\":").append(quote(routingKey));
+        if (a != null && !a.exchange().isBlank()) {
             sb.append(",\"exchange\":").append(quote(a.exchange()));
         }
-        TypeMirror payloadType = payloadTypeOf(a);
-        String payload = payloadType == null ? null : payloadType.toString();
-        if (payload != null) {
-            sb.append(",\"payload\":").append(quote(payload));
+        if (payloadType != null) {
+            // Effacement des paramètres de type : `GenericEvent<T>` s'affiche
+            // `GenericEvent`. Les arguments réels, quand ils existent, sont déjà
+            // portés par les entrées du schéma.
+            String name = processingEnv.getTypeUtils().erasure(payloadType).toString();
+            sb.append(",\"payload\":").append(quote(name));
         }
-        if (!a.kind().isBlank()) {
-            sb.append(",\"kind\":").append(quote(a.kind()));
+        if (kind != null && !kind.isBlank()) {
+            sb.append(",\"kind\":").append(quote(kind));
         }
         sb.append(",\"source\":").append(quote(describe(element)));
 
@@ -110,7 +328,8 @@ public class PublishedEventProcessor extends AbstractProcessor {
             if (!fields.isEmpty()) {
                 StringJoiner j = new StringJoiner(",", "[", "]");
                 for (SchemaExtractor.Field f : fields) {
-                    j.add("{\"path\":" + quote(f.path()) + ",\"type\":" + quote(f.type()) + "}");
+                    j.add("{\"path\":" + quote(f.path()) + ",\"type\":" + quote(f.type())
+                            + (f.bound() ? ",\"bound\":true" : "") + "}");
                 }
                 sb.append(",\"schema\":").append(j);
             }
@@ -124,19 +343,30 @@ public class PublishedEventProcessor extends AbstractProcessor {
      * son {@code TypeMirror} existe. C'est précisément ce dont on a besoin pour
      * en extraire le schéma.
      */
-    private TypeMirror payloadTypeOf(PublishesEvent a) {
-        TypeMirror mirror;
-        try {
-            Class<?> c = a.payload();
-            mirror = processingEnv.getElementUtils().getTypeElement(c.getCanonicalName()).asType();
-        } catch (MirroredTypeException e) {
-            mirror = e.getTypeMirror();
+    private TypeMirror payloadTypeOf(PublishesEvent a, Element element) {
+        TypeMirror mirror = null;
+        if (a != null) {
+            try {
+                Class<?> c = a.payload();
+                TypeElement te = processingEnv.getElementUtils().getTypeElement(c.getCanonicalName());
+                mirror = te == null ? null : te.asType();
+            } catch (MirroredTypeException e) {
+                mirror = e.getTypeMirror();
+            }
         }
-        if (mirror == null) {
-            return null;
+        boolean unset = mirror == null
+                || "java.lang.Void".equals(mirror.toString())
+                || "void".equals(mirror.toString());
+        if (!unset) {
+            return mirror;
         }
-        String name = mirror.toString();
-        return "java.lang.Void".equals(name) || "void".equals(name) ? null : mirror;
+        // Classe d'événement : le payload, c'est elle. L'exiger en plus
+        // (`payload = OrderCreated.class` sur OrderCreated) serait une redite que
+        // rien ne garantit cohérente.
+        if (element instanceof TypeElement te) {
+            return te.asType();
+        }
+        return null;
     }
 
     /**
@@ -148,29 +378,47 @@ public class PublishedEventProcessor extends AbstractProcessor {
      */
     private String describe(Element element) {
         if (element.getKind() == ElementKind.METHOD) {
-            Element owner = element.getEnclosingElement();
-            return owner + "#" + element.getSimpleName();
+            return element.getEnclosingElement() + "#" + element.getSimpleName();
         }
         return element.toString();
     }
 
+    private void warn(Element el, String msg) {
+        processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING, "event-map : " + msg, el);
+    }
+
+    private void error(Element el, String msg) {
+        processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "event-map : " + msg, el);
+    }
+
     private void write() {
-        if (entries.isEmpty()) {
+        writeJsonArray(OUTPUT, entries, "publication(s)");
+        writeJsonArray(OUTPUT_CONSUMERS, consumerEntries, "attente(s) de consommateur");
+        // On journalise même à vide : « rien ne se passe » doit rester
+        // distinguable de « le processeur n'a pas tourné ».
+        if (entries.isEmpty() && consumerEntries.isEmpty()) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
+                    "event-map : ni publication ni @RabbitListener détecté dans ce module.");
+        }
+    }
+
+    private void writeJsonArray(String path, List<String> items, String label) {
+        if (items.isEmpty()) {
             return;
         }
         try {
             Filer filer = processingEnv.getFiler();
-            FileObject file = filer.createResource(StandardLocation.CLASS_OUTPUT, "", OUTPUT);
+            FileObject file = filer.createResource(StandardLocation.CLASS_OUTPUT, "", path);
             try (Writer w = file.openWriter()) {
                 w.write("[\n");
-                w.write(String.join(",\n", entries));
+                w.write(String.join(",\n", items));
                 w.write("\n]\n");
             }
-            processingEnv.getMessager().printMessage(
-                    Diagnostic.Kind.NOTE, "event-map : " + entries.size() + " publication(s) écrite(s) dans " + OUTPUT);
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
+                    "event-map : " + items.size() + " " + label + " écrite(s) dans " + path);
         } catch (IOException e) {
-            processingEnv.getMessager().printMessage(
-                    Diagnostic.Kind.WARNING, "event-map : écriture de " + OUTPUT + " impossible — " + e.getMessage());
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
+                    "event-map : écriture de " + path + " impossible — " + e.getMessage());
         }
     }
 

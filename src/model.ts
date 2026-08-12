@@ -84,6 +84,12 @@ export interface SchemaField {
   path: string;
   /** FQN, type primitif, `enum[A,B]` ou `Map<K,V>`. */
   type: string;
+  /**
+   * Le type n'est qu'une **borne** : la classe est restée générique et le
+   * paramètre n'était pas fixé au point de déclaration. Le contrat réel est au
+   * moins celui-là, peut-être plus précis.
+   */
+  bound?: boolean;
 }
 
 export interface Publication {
@@ -104,6 +110,10 @@ export interface Subscription {
   queue: string;
   handler?: string;
   confidence: Confidence;
+  /** Type que le handler sait lire, quand l'agent a pu l'extraire. */
+  payload?: string;
+  /** Structure attendue par le handler — l'autre moitié du contrat. */
+  schema?: SchemaField[];
 }
 
 /** Arête résolue : un producteur atteint un consommateur via un binding. */
@@ -139,7 +149,11 @@ export type WarningCode =
   /** Routing key non résolue statiquement. */
   | 'dynamic-key'
   /** Consommateur d'une queue qu'aucun producteur connu n'alimente. */
-  | 'starved-queue';
+  | 'starved-queue'
+  /** Deux services publient la même clé avec des payloads différents. */
+  | 'schema-divergence'
+  /** Un consommateur attend un champ que le producteur n'envoie pas. */
+  | 'contract-mismatch';
 
 export interface Warning {
   level: 'error' | 'warn' | 'info';
@@ -177,6 +191,13 @@ export interface ServiceManifest {
     schema?: SchemaField[];
   }>;
   observed?: Array<{ exchange: string; routingKey: string; payload?: string }>;
+  /** Ce que les `@RabbitListener` du service savent lire. */
+  expects?: Array<{
+    handler: string;
+    payload: string;
+    queues: string[];
+    schema?: SchemaField[];
+  }>;
 }
 
 export function emptyMap(): EventMap {

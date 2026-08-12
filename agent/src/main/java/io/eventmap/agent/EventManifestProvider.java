@@ -19,6 +19,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.UnaryOperator;
 
 /**
  * Construit le manifeste du service, indépendamment de la façon dont il sera servi.
@@ -34,26 +35,33 @@ import java.util.Set;
 public class EventManifestProvider {
 
     private static final String MANIFEST_PATTERN = "classpath*:META-INF/event-publishers.json";
+    private static final String CONSUMERS_PATTERN = "classpath*:META-INF/event-consumers.json";
+    private static final String APPLICATION_PLACEHOLDER = PublishedEventProcessor.APPLICATION_PLACEHOLDER;
 
     private final ObjectProvider<Binding> bindings;
     private final ObjectProvider<RabbitListenerEndpointRegistry> registries;
     private final ObjectProvider<ObservedPublicationRecorder> recorders;
     private final ObjectMapper mapper;
     private final String applicationName;
+    /** Sert à résoudre les `${...}` dans les noms de queues des @RabbitListener. */
+    private final UnaryOperator<String> placeholderResolver;
 
     /** Le manifeste est immuable pendant la vie du process : on le lit une fois. */
     private volatile List<Map<String, Object>> cachedPublishes;
+    private volatile List<Map<String, Object>> cachedExpectations;
 
     public EventManifestProvider(ObjectProvider<Binding> bindings,
                                  ObjectProvider<RabbitListenerEndpointRegistry> registries,
                                  ObjectProvider<ObservedPublicationRecorder> recorders,
                                  ObjectMapper mapper,
-                                 String applicationName) {
+                                 String applicationName,
+                                 UnaryOperator<String> placeholderResolver) {
         this.bindings = bindings;
         this.registries = registries;
         this.recorders = recorders;
         this.mapper = mapper;
         this.applicationName = applicationName;
+        this.placeholderResolver = placeholderResolver;
     }
 
     public Map<String, Object> manifest() {
@@ -62,6 +70,7 @@ public class EventManifestProvider {
         body.put("consumes", consumes());
         body.put("listening", listening());
         body.put("publishes", publishes());
+        body.put("expects", expectations());
 
         ObservedPublicationRecorder recorder = recorders.getIfAvailable();
         if (recorder != null) {
@@ -127,6 +136,7 @@ public class EventManifestProvider {
                     all.addAll(mapper.readValue(in, new TypeReference<List<Map<String, Object>>>() { }));
                 }
             }
+            all.forEach(this::resolveApplicationPlaceholder);
         } catch (IOException e) {
             // Un manifeste illisible ne doit jamais empêcher le service de répondre :
             // le job dégradera en « publications inconnues » pour ce service.
@@ -134,5 +144,69 @@ public class EventManifestProvider {
         }
         this.cachedPublishes = List.copyOf(all);
         return this.cachedPublishes;
+    }
+
+    /**
+     * Ce que les {@code @RabbitListener} du service savent lire.
+     *
+     * <p>Les noms de queues viennent de l'annotation, où ils sont très souvent
+     * écrits {@code ${app.queue.orders}} : on les résout ici, seul endroit qui
+     * connaisse la configuration effective.
+     */
+    private List<Map<String, Object>> expectations() {
+        List<Map<String, Object>> cached = this.cachedExpectations;
+        if (cached != null) {
+            return cached;
+        }
+        List<Map<String, Object>> all = new ArrayList<>();
+        try {
+            Resource[] resources = new PathMatchingResourcePatternResolver().getResources(CONSUMERS_PATTERN);
+            for (Resource resource : resources) {
+                try (InputStream in = resource.getInputStream()) {
+                    all.addAll(mapper.readValue(in, new TypeReference<List<Map<String, Object>>>() { }));
+                }
+            }
+            all.forEach(this::resolveQueuePlaceholders);
+        } catch (IOException e) {
+            all = List.of();
+        }
+        this.cachedExpectations = List.copyOf(all);
+        return this.cachedExpectations;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void resolveQueuePlaceholders(Map<String, Object> entry) {
+        Object queues = entry.get("queues");
+        if (!(queues instanceof List<?> list)) {
+            return;
+        }
+        List<String> resolved = new ArrayList<>(list.size());
+        for (Object q : list) {
+            String raw = String.valueOf(q);
+            try {
+                resolved.add(placeholderResolver.apply(raw));
+            } catch (RuntimeException e) {
+                // Placeholder non résolvable (SpEL `#{...}`, propriété absente) :
+                // on garde la forme brute plutôt que de faire échouer l'endpoint.
+                resolved.add(raw);
+            }
+        }
+        ((Map<String, Object>) entry).put("queues", resolved);
+    }
+
+    /**
+     * Remplace {@code {application}} par le nom réel du service.
+     *
+     * <p>La convention {@code evt.<application>.<NomDeClasse>} ne peut pas être
+     * résolue à la compilation : {@code spring.application.name} est une valeur de
+     * configuration, et l'artifactId Maven n'en est pas toujours le reflet. Le
+     * processeur laisse donc un marqueur, et c'est le service — seul à connaître
+     * son propre nom avec certitude — qui le substitue en servant le manifeste.
+     */
+    private void resolveApplicationPlaceholder(Map<String, Object> entry) {
+        Object key = entry.get("routingKey");
+        if (key instanceof String s && s.contains(APPLICATION_PLACEHOLDER)) {
+            entry.put("routingKey", s.replace(APPLICATION_PLACEHOLDER, applicationName));
+        }
     }
 }

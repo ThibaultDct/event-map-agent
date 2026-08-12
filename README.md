@@ -373,7 +373,53 @@ jamais emprunté depuis le démarrage du pod reste invisible. Ces arêtes sont m
 `observed` et tracées en pointillé. Excellent pour démarrer et pour découvrir l'existant,
 insuffisant comme documentation de référence.
 
-**Niveau 2 — annoter, pour une carte exacte.**
+**Niveau 2 — la convention, sans rien déclarer.**
+
+Si vos messages héritent de types de base — une enveloppe `FxEvent`, une classe `Command` —
+le processeur les reconnaît seul et **calcule les routing keys**. Déclarez ces types une
+fois, dans le pom de la stack :
+
+```xml
+<compilerArgs>
+  <arg>-Aeventmap.eventBase=com.acme.stack.FxEvent</arg>
+  <arg>-Aeventmap.commandBase=com.acme.stack.Command</arg>
+</compilerArgs>
+```
+
+La convention appliquée :
+
+| | Clé produite |
+|---|---|
+| Événement | `evt.<application>.<NomDeClasse>` |
+| Commande | `cmd.<cible>.<NomDeClasse>` |
+
+```java
+// Aucune annotation → evt.client-instruction-worker.InstructionUpdatedEvent
+public class InstructionUpdatedEvent extends FxEvent<ClientInstructionDto> { }
+
+// Seule la cible est déclarée → cmd.client-instruction-worker.CreateClientInstructionCommand
+@PublishesEvent(target = "client-instruction-worker")
+public class CreateClientInstructionCommand extends Command { }
+```
+
+Le nom de l'application n'est pas connu du compilateur. Le manifeste conserve donc le
+marqueur `{application}`, que l'agent substitue au démarrage par `spring.application.name` —
+plus fiable que de passer l'artifactId Maven, qui n'en est pas toujours le reflet.
+
+Les classes **abstraites** sont exclues : une enveloppe intermédiaire n'est pas un message.
+Une commande sans `target` **casse le build**, avec un message pointant la classe : sa cible
+ne peut pas être déduite du code.
+
+**Niveau 3 — l'annotation explicite, pour les exceptions.**
+
+```java
+@PublishesEvent(routingKey = "evt.legacy.v1.instruction-updated")
+public class LegacyInstructionEvent extends FxEvent<ClientInstructionDto> { }
+```
+
+Une `routingKey` explicite l'emporte toujours sur la convention. C'est ce qu'il faut pour
+un message historique dont la clé ne suit pas le format, ou pour une publication portée par
+une méthode :
 
 ```java
 @PublishesEvent(routingKey = "evt.order.created", payload = OrderCreatedEvent.class)
@@ -382,6 +428,9 @@ public void publishOrderCreated(Order order) {
 }
 ```
 
+Sur une méthode, la `routingKey` est obligatoire : rien ne permet de la déduire d'une
+signature — et surtout pas d'une façade générique, qui émet des dizaines de messages.
+
 L'annotation est répétable, et `exchange` peut être omis si le système n'a qu'un seul
 exchange topic — le job le déduit. Le processeur casse le build si la routing key contient
 un joker AMQP.
@@ -389,6 +438,38 @@ un joker AMQP.
 Renseigner `payload` active en plus la **détection de rupture de contrat** : le processeur
 extrait la structure de la classe et le job compare d'un scan à l'autre
 (cf. [§7 bis](#7-bis-les-ruptures-de-contrat)).
+
+#### Cas d'une façade de publication générique
+
+Beaucoup de stacks centralisent l'émission derrière une méthode unique :
+
+```java
+public <T extends InstructionDto> void publish(final FxEvent<T> event) { ... }
+```
+
+**N'annotez pas cette méthode.** Elle émet des dizaines de messages différents ; y poser
+un `@PublishesEvent` figerait une seule clé pour tous. La connaissance « quelle clé, quel
+payload » appartient à l'événement, pas au transport. Annotez donc les classes concrètes :
+
+```java
+@PublishesEvent(routingKey = "evt.fx.trade.executed")
+public class FxTradeExecuted extends FxEvent<FxInstructionDto> { ... }
+```
+
+Sur une classe, `payload` vaut par défaut la classe annotée, et les variables de type des
+parents génériques sont **résolues** — le schéma contiendra `instruction : FxInstructionDto`
+et ses champs, pas `instruction : T`.
+
+> **⚠️ Attribution.** Le manifeste est produit dans le jar où vit la classe annotée, et
+> chaque service fusionne tous ceux de son classpath. Si vos événements sont déclarés dans
+> un module de contrats **partagé**, tous les services se diront producteurs de tout.
+> Trois façons de s'en sortir :
+>
+> | Où vivent les classes d'événements | Quoi annoter |
+> |---|---|
+> | Dans le service qui les émet | la classe d'événement |
+> | Dans un module de contrats partagé | le **point d'appel**, dans le service émetteur |
+> | Idem, mais trop de points d'appel | rien — `record-observed: true` attribue au runtime |
 
 > **Pourquoi une annotation plutôt qu'un scan automatique du code ?** Parce qu'une
 > heuristique sur les appels `convertAndSend` plafonne vers 85 % dès que les routing keys
@@ -609,6 +690,8 @@ C'est là que se trouve la valeur opérationnelle. Chaque code répond à une qu
 | `unknown-consumer` | Un consommateur AMQP dont l'IP ne correspond à aucun pod scanné | Namespace hors périmètre, port-forward d'un dev, ou consommateur hors cluster |
 | `manifest-unreachable` | Un pod n'a pas répondu sur `/internal/event-manifest` | Agent non déployé sur ce service — sa moitié producteur manquera |
 | `dynamic-key` | Routing key non résolue statiquement | Annoter la valeur concrète, ou activer `record-observed` |
+| `schema-divergence` | Deux services publient la même clé avec des payloads différents | Bug franc : les consommateurs ne peuvent pas lire les deux |
+| `contract-mismatch` | Un consommateur attend un champ que le producteur n'envoie pas, ou d'un autre type | Bug franc, invisible en test unitaire — cf. ci-dessous |
 
 ---
 
@@ -666,6 +749,46 @@ Séparé de `FAIL_ON_NEW_WARNINGS` à dessein : une rupture de contrat n'a prati
 faux positif, alors que les anomalies de topologie en comportent tant que la dette initiale
 n'est pas triée. **Activez celui-ci dès le premier jour**, et l'autre bien plus tard.
 
+### Producteur contre consommateur
+
+La comparaison temporelle confronte un payload à **sa propre version passée**. Elle ne dit
+rien de l'accord entre les deux bouts. Or c'est là que vit le seul défaut qu'aucun test
+unitaire ne rattrape : il est dans l'intervalle entre deux services, et ne se manifeste
+qu'en production.
+
+L'agent extrait donc aussi le type que chaque `@RabbitListener` sait lire — même processeur,
+même résolution des génériques — et le job confronte les deux moitiés :
+
+```
+💥 contract-mismatch
+   billing-worker attend de order-api un OrderCreatedEvent incompatible sur evt.order.created —
+   champs attendus jamais envoyés : discountCode ;
+   types incompatibles : total envoyé long, attendu BigDecimal.
+   Handler : com.acme.billing.OrderListener#onCreated.
+```
+
+**Le sens compte.** Un champ que le consommateur attend et que le producteur n'envoie pas
+casse la désérialisation ou produit un `null` silencieux : c'est signalé. L'inverse — un
+champ envoyé que personne ne lit — est bénin, un lecteur tolérant l'ignore : ce n'est pas
+signalé.
+
+Le paramètre porteur du corps est celui annoté `@Payload`, ou à défaut le premier qui n'est
+ni un type d'infrastructure (`Message`, `Channel`, `MessageHeaders`) ni un en-tête. Un
+handler purement technique — qui ne reçoit qu'un `Message` brut — n'a pas de contrat de
+structure et n'est pas comparé.
+
+Les noms de queues sont très souvent écrits `${app.queues.instructions}` dans l'annotation :
+l'agent les résout au démarrage contre l'`Environment`, seul endroit qui connaisse la
+configuration effective. Un `#{...}` SpEL n'est pas résolu et reste sous forme brute.
+
+### Divergence entre producteurs
+
+Si deux services publient la même routing key avec des payloads différents, les
+consommateurs ne peuvent pas lire les deux. C'était jusqu'ici invisible : la comparaison
+temporelle en retenait un arbitrairement et se taisait — pire, le diff se mettait à osciller
+selon lequel des deux gagnait. C'est désormais une anomalie de niveau `error`, qui nomme les
+deux services et les champs en cause.
+
 ### Ce que le schéma ne capture pas
 
 **On lit les champs, Jackson sérialise les accesseurs.** Pour un record, une classe Lombok
@@ -681,6 +804,27 @@ sans attendre le déploiement — c'est la suite naturelle, pas encore faite.
 
 **La profondeur est bornée à 4 niveaux**, et les références circulaires sont coupées : un
 graphe d'objets profond n'apporte plus d'information de contrat utile.
+
+**Les génériques sont résolus quand ils peuvent l'être.** Deux formes se ressemblent mais
+ne donnent pas le même schéma :
+
+```java
+// A — le paramètre est fixé par la classe : résolution complète
+class InstructionUpdatedEvent extends FxEvent<ClientInstructionDto> { }
+//   payload             ClientInstructionDto
+//   payload.clientRef   String
+//   payload.amount      BigDecimal
+
+// B — la classe reste générique : repli sur la borne
+class GenericInstructionEvent<T extends InstructionDto> extends FxEvent<T> { }
+//   payload             InstructionDto        ← borne
+//   payload.instructionId  String
+```
+
+Les champs issus d'une borne portent `"bound": true` dans le manifeste. Le détecteur de
+rupture en tient compte : quand une classe passe de générique à paramétrée, le type se
+précise sans que le contrat change, et le changement est classé comme additif — sinon le
+garde-fou échouerait à chaque fois qu'on resserre un type.
 
 ---
 

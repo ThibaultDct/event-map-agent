@@ -17,12 +17,36 @@ import java.lang.annotation.Target;
  * routing keys sont construites dynamiquement ; cette annotation monte à 100 %
  * pour le coût d'une ligne.
  *
+ * <p><b>Sur une méthode</b>, quand celle-ci publie un message précis :
+ *
  * <pre>{@code
  * @PublishesEvent(routingKey = "evt.order.created", payload = OrderCreatedEvent.class)
  * public void publishOrderCreated(Order order) {
  *     rabbitTemplate.convertAndSend(EXCHANGE, "evt.order.created", toEvent(order));
  * }
  * }</pre>
+ *
+ * <p><b>Sur la classe d'événement</b>, quand la publication passe par une façade
+ * générique. Une méthode {@code <T extends InstructionDto> void publish(FxEvent<T>)}
+ * émet des dizaines de messages différents : y poser l'annotation figerait une seule
+ * clé pour tous. La connaissance « quelle clé, quel payload » appartient à
+ * l'événement, pas au transport :
+ *
+ * <pre>{@code
+ * @PublishesEvent(routingKey = "evt.fx.trade.executed")
+ * public class FxTradeExecuted extends FxEvent<FxInstructionDto> { ... }
+ * }</pre>
+ *
+ * Sur une classe, {@link #payload()} vaut par défaut la classe annotée elle-même,
+ * et les variables de type des parents génériques sont résolues : le schéma de
+ * l'exemple ci-dessus contiendra {@code instruction : FxInstructionDto}, pas
+ * {@code instruction : T}.
+ *
+ * <p><b>Attention à l'attribution.</b> Le manifeste est produit dans le jar où se
+ * trouve la classe annotée, et le service fusionne tous les manifestes de son
+ * classpath. Si vos classes d'événements vivent dans un module de contrats
+ * partagé par plusieurs services, chacun se déclarera producteur de tout.
+ * Dans ce cas, annotez plutôt le point d'appel, dans le service émetteur.
  *
  * <p>L'annotation est lue à la <em>compilation</em> par {@link PublishedEventProcessor},
  * qui produit {@code META-INF/event-publishers.json} dans le jar. Elle est conservée
@@ -34,8 +58,25 @@ import java.lang.annotation.Target;
 @Repeatable(PublishesEvents.class)
 public @interface PublishesEvent {
 
-    /** Routing key concrète émise. Ne doit contenir ni {@code *} ni {@code #}. */
-    String routingKey();
+    /**
+     * Routing key concrète émise. Ne doit contenir ni {@code *} ni {@code #}.
+     *
+     * <p>Facultative sur une classe : laissée vide, elle est <b>calculée</b> selon
+     * la convention {@code evt.<application>.<NomDeClasse>} pour un événement et
+     * {@code cmd.<cible>.<NomDeClasse>} pour une commande. Obligatoire en revanche
+     * sur une méthode, où rien ne permet de la déduire.
+     */
+    String routingKey() default "";
+
+    /**
+     * Worker destinataire, pour une commande.
+     *
+     * <p>Une commande est <em>adressée</em> : contrairement à un événement, dont
+     * l'origine est le service émetteur lui-même, la cible ne figure nulle part
+     * dans le code et doit être déclarée. C'est la seule information que la
+     * convention ne peut pas déduire.
+     */
+    String target() default "";
 
     /** Type du corps du message. {@code Void} signifie « non précisé ». */
     Class<?> payload() default Void.class;

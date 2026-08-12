@@ -12,6 +12,7 @@ import {
   type Warning,
 } from '../model.js';
 import { amqpMatch, isPattern } from './amqp.js';
+import { isEmptyDelta, schemaDelta } from './contract.js';
 
 export interface CorrelateInput {
   k8s: K8sSnapshot;
@@ -116,9 +117,32 @@ export function correlate(input: CorrelateInput): EventMap {
   const subs = new Map<string, Subscription>();
   const subsByQueue = new Map<string, Set<string>>();
 
+  // Ce que chaque handler sait lire, indexé par (service, queue) : c'est ce qui
+  // permettra de confronter le contrat au producteur.
+  const expectations = new Map<string, { payload: string; schema?: typeof map.publishes[0]['schema']; handler: string }>();
+  for (const [svcId, m] of manifests) {
+    for (const e of m.expects ?? []) {
+      for (const q of e.queues ?? []) {
+        expectations.set(`${svcId}|${q}`, { payload: e.payload, schema: e.schema, handler: e.handler });
+      }
+    }
+  }
+
   const addSub = (service: string, queue: string, confidence: Subscription['confidence']) => {
     const k = `${service}|${queue}`;
-    if (!subs.has(k)) subs.set(k, { service, queue, confidence });
+    if (!subs.has(k)) {
+      const expected = expectations.get(k);
+      subs.set(k, {
+        service,
+        queue,
+        confidence,
+        payload: expected?.payload,
+        handler: expected?.handler,
+        schema: expected?.schema
+          ? [...expected.schema].sort((a, b) => a.path.localeCompare(b.path))
+          : undefined,
+      });
+    }
     if (!subsByQueue.has(queue)) subsByQueue.set(queue, new Set());
     subsByQueue.get(queue)!.add(service);
   };
@@ -318,5 +342,119 @@ export function correlate(input: CorrelateInput): EventMap {
     });
   }
 
+  detectSchemaDivergence(map);
+  detectContractMismatch(map, subs);
+
   return map;
+}
+
+/** Résumé lisible d'un écart de schéma, tronqué pour rester dans un message. */
+function summarizeDelta(delta: ReturnType<typeof schemaDelta>, leftLabel: string, rightLabel: string): string {
+  const parts: string[] = [];
+  const list = (fields: { path: string }[]) => fields.slice(0, 4).map((f) => f.path).join(', ')
+    + (fields.length > 4 ? `, +${fields.length - 4}` : '');
+  if (delta.onlyInLeft.length) parts.push(`absents chez ${rightLabel} : ${list(delta.onlyInLeft)}`);
+  if (delta.onlyInRight.length) parts.push(`absents chez ${leftLabel} : ${list(delta.onlyInRight)}`);
+  if (delta.typeMismatch.length) {
+    parts.push(
+      'types divergents : ' +
+        delta.typeMismatch
+          .slice(0, 3)
+          .map((m) => `${m.path} (${short(m.left.type)} / ${short(m.right.type)})`)
+          .join(', ') +
+        (delta.typeMismatch.length > 3 ? `, +${delta.typeMismatch.length - 3}` : ''),
+    );
+  }
+  return parts.join(' · ');
+}
+
+function short(type: string): string {
+  if (type.startsWith('enum[') || type.startsWith('Map<')) return type;
+  return type.split('.').pop() ?? type;
+}
+
+/**
+ * Deux services publiant la même clé doivent publier la même chose.
+ *
+ * Sans ce contrôle, `indexSchemas` en retenait un arbitrairement pour la
+ * comparaison temporelle : la divergence passait inaperçue, et le diff de
+ * contrat se mettait à osciller selon lequel des deux gagnait.
+ */
+function detectSchemaDivergence(map: EventMap): void {
+  const byKey = new Map<string, Publication[]>();
+  for (const p of map.publishes) {
+    if (!p.schema || p.schema.length === 0) continue;
+    const k = `${p.exchange}|${p.routingKey}`;
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k)!.push(p);
+  }
+
+  for (const [k, list] of byKey) {
+    if (list.length < 2) continue;
+    const [reference, ...others] = list;
+    for (const other of others) {
+      const delta = schemaDelta(reference!.schema!, other.schema!);
+      if (isEmptyDelta(delta)) continue;
+      map.warnings.push({
+        level: 'error',
+        code: 'schema-divergence',
+        message:
+          `${reference!.service} et ${other.service} publient tous deux ${reference!.routingKey} ` +
+          `avec des payloads différents — ${summarizeDelta(delta, reference!.service, other.service)}. ` +
+          `Les consommateurs ne peuvent pas lire les deux.`,
+        ref: k,
+      });
+    }
+  }
+}
+
+/**
+ * Confronte ce qu'un producteur envoie à ce que ses consommateurs savent lire.
+ *
+ * C'est le seul défaut qu'aucun test unitaire ne rattrape : il vit dans
+ * l'intervalle entre deux services, et ne se manifeste qu'en production. Un
+ * champ que le consommateur attend et que le producteur n'envoie pas casse la
+ * désérialisation ou produit un `null` silencieux ; l'inverse est bénin, un
+ * lecteur tolérant ignore ce qu'il ne connaît pas.
+ */
+function detectContractMismatch(map: EventMap, subs: Map<string, Subscription>): void {
+  const seen = new Set<string>();
+
+  for (const f of map.flows) {
+    const producer = map.publishes.find(
+      (p) => p.service === f.from && p.exchange === f.exchange && p.routingKey === f.routingKey,
+    );
+    const consumer = subs.get(`${f.to}|${f.queue}`);
+    if (!producer?.schema?.length || !consumer?.schema?.length) continue;
+
+    const id = `${f.routingKey}|${f.to}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    const delta = schemaDelta(producer.schema, consumer.schema);
+    // `onlyInRight` = attendu par le consommateur, jamais envoyé : c'est ce qui
+    // casse. `onlyInLeft` = envoyé sans être lu, sans conséquence.
+    const missing = delta.onlyInRight;
+    if (missing.length === 0 && delta.typeMismatch.length === 0) continue;
+
+    const details: string[] = [];
+    if (missing.length) {
+      details.push(`champs attendus jamais envoyés : ${missing.slice(0, 4).map((m) => m.path).join(', ')}`
+        + (missing.length > 4 ? `, +${missing.length - 4}` : ''));
+    }
+    if (delta.typeMismatch.length) {
+      details.push('types incompatibles : ' + delta.typeMismatch.slice(0, 3)
+        .map((m) => `${m.path} envoyé ${short(m.left.type)}, attendu ${short(m.right.type)}`).join(' · '));
+    }
+
+    map.warnings.push({
+      level: 'error',
+      code: 'contract-mismatch',
+      message:
+        `${f.to} attend de ${f.from} un ${consumer.payload ?? 'payload'} incompatible sur ${f.routingKey} — ` +
+        `${details.join(' ; ')}.` +
+        (consumer.handler ? ` Handler : ${consumer.handler}.` : ''),
+      ref: id,
+    });
+  }
 }

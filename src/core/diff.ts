@@ -86,6 +86,8 @@ const ICON: Record<Warning['code'], string> = {
   'binding-drift': '↔️',
   'dynamic-key': '🌀',
   'starved-queue': '🍽️',
+  'schema-divergence': '🔀',
+  'contract-mismatch': '💥',
 };
 
 /**
